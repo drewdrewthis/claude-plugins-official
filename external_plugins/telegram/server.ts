@@ -98,6 +98,8 @@ type Access = {
   textChunkLimit?: number
   /** Split on paragraph boundaries instead of hard char count. */
   chunkMode?: 'length' | 'newline'
+  /** Extra commands to register in Telegram's "/" menu. Each entry needs command (lowercase a-z, underscores) and description. */
+  commands?: Array<{ command: string; description: string }>
 }
 
 function defaultAccess(): Access {
@@ -142,6 +144,7 @@ function readAccessFile(): Access {
       replyToMode: parsed.replyToMode,
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
+      commands: parsed.commands,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
@@ -963,12 +966,18 @@ void (async () => {
         onStart: info => {
           botUsername = info.username
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
+          // Register commands in Telegram's "/" autocomplete menu.
+          // Built-in bot commands plus any user-configured commands from
+          // access.json's "commands" array. User commands are appended
+          // after built-ins, so they appear below in the menu.
+          const builtinCommands = [
+            { command: 'start', description: 'Welcome and setup guide' },
+            { command: 'help', description: 'What this bot can do' },
+            { command: 'status', description: 'Check your pairing status' },
+          ]
+          const userCommands = readAccessFile().commands ?? []
           void bot.api.setMyCommands(
-            [
-              { command: 'start', description: 'Welcome and setup guide' },
-              { command: 'help', description: 'What this bot can do' },
-              { command: 'status', description: 'Check your pairing status' },
-            ],
+            [...builtinCommands, ...userCommands],
             { scope: { type: 'all_private_chats' } },
           ).catch(() => {})
         },
