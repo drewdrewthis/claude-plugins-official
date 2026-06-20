@@ -51,6 +51,22 @@ if (!TOKEN) {
   process.exit(1)
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+const PID_FILE = join(STATE_DIR, 'bot.pid')
+
+// Telegram allows exactly one getUpdates consumer per token. If a previous
+// session crashed (SIGKILL, terminal closed) its server.ts grandchild can
+// survive as an orphan and hold the slot forever, so every new session sees
+// 409 Conflict. Kill any stale holder before we start polling.
+mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+try {
+  const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
+  if (stale > 1 && stale !== process.pid) {
+    process.kill(stale, 0)
+    process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
+    process.kill(stale, 'SIGTERM')
+  }
+} catch {}
+writeFileSync(PID_FILE, String(process.pid))
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -84,7 +100,10 @@ type GroupPolicy = {
 }
 
 type Access = {
-  dmPolicy: 'pairing' | 'allowlist' | 'disabled'
+  // 'open' (fork addition): deliver every DM with no pairing/allowlist, so a
+  // public/onboarding bot can greet anyone. allowFrom still lists "known" users
+  // (e.g. the operator) but is not required for delivery in this mode.
+  dmPolicy: 'pairing' | 'allowlist' | 'disabled' | 'open'
   allowFrom: string[]
   groups: Record<string, GroupPolicy>
   pending: Record<string, PendingEntry>
@@ -98,8 +117,6 @@ type Access = {
   textChunkLimit?: number
   /** Split on paragraph boundaries instead of hard char count. */
   chunkMode?: 'length' | 'newline'
-  /** Extra commands to register in Telegram's "/" menu. Each entry needs command (lowercase a-z, underscores) and description. */
-  commands?: Array<{ command: string; description: string }>
 }
 
 function defaultAccess(): Access {
@@ -144,7 +161,6 @@ function readAccessFile(): Access {
       replyToMode: parsed.replyToMode,
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
-      commands: parsed.commands,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
@@ -181,6 +197,10 @@ function loadAccess(): Access {
 // would deliver from. Telegram DM chat_id == user_id, so allowFrom covers DMs.
 function assertAllowedChat(chat_id: string): void {
   const access = loadAccess()
+  // 'open' policy: the inbound gate delivers any DM, so the outbound gate must
+  // also let the bot REPLY/REACT to any chat — otherwise it receives but can't
+  // answer (throws "not allowlisted"). BOTH gates are required for open mode.
+  if (access.dmPolicy === 'open') return
   if (access.allowFrom.includes(chat_id)) return
   if (chat_id in access.groups) return
   throw new Error(`chat ${chat_id} is not allowlisted — add via /telegram:access`)
@@ -217,6 +237,12 @@ function gate(ctx: Context): GateResult {
   if (pruned) saveAccess(access)
 
   if (access.dmPolicy === 'disabled') return { action: 'drop' }
+  // 'open' policy: deliver every chat (DMs and groups) with no pairing or
+  // allowlist check. Matches the outbound early-return in assertAllowedChat.
+  // NOTE: this also bypasses the per-group mention/allowFrom policy below, so
+  // 'open' is fully open (DMs + groups). The intended deployment is a sandboxed
+  // public bot whose real boundary is container isolation, not this gate.
+  if (access.dmPolicy === 'open') return { action: 'deliver', access }
 
   const from = ctx.from
   if (!from) return { action: 'drop' }
@@ -269,6 +295,19 @@ function gate(ctx: Context): GateResult {
   }
 
   return { action: 'drop' }
+}
+
+// Like gate() but for bot commands: no pairing side effects, just allow/drop.
+function dmCommandGate(ctx: Context): { access: Access; senderId: string } | null {
+  if (ctx.chat?.type !== 'private') return null
+  if (!ctx.from) return null
+  const senderId = String(ctx.from.id)
+  const access = loadAccess()
+  const pruned = pruneExpired(access)
+  if (pruned) saveAccess(access)
+  if (access.dmPolicy === 'disabled') return null
+  if (access.dmPolicy === 'allowlist' && !access.allowFrom.includes(senderId)) return null
+  return { access, senderId }
 }
 
 function isMentioned(ctx: Context, extraPatterns?: string[]): boolean {
@@ -403,20 +442,7 @@ mcp.setNotificationHandler(
     const { request_id, tool_name, description, input_preview } = params
     pendingPermissions.set(request_id, { tool_name, description, input_preview })
     const access = loadAccess()
-    // Show tool name + description + a compact input summary so the user
-    // can make an informed decision without tapping "See more".
-    let summary = ''
-    try {
-      const input = JSON.parse(input_preview)
-      // Extract the most useful field for common tools:
-      // Edit/Write → file_path, Bash → command, etc.
-      const path = input.file_path ?? input.path ?? input.pattern
-      const cmd = input.command
-      if (path) summary = `\n📄 ${path}`
-      else if (cmd) summary = `\n💻 ${cmd.length > 80 ? cmd.slice(0, 77) + '...' : cmd}`
-    } catch {}
-    const desc = description ? `\n${description}` : ''
-    const text = `🔐 Permission: ${tool_name}${summary}${desc}`
+    const text = `🔐 Permission: ${tool_name}`
     const keyboard = new InlineKeyboard()
       .text('See more', `perm:more:${request_id}`)
       .text('✅ Allow', `perm:allow:${request_id}`)
@@ -637,6 +663,9 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('telegram channel: shutting down\n')
+  try {
+    if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
+  } catch {}
   // bot.stop() signals the poll loop to end; the current getUpdates request
   // may take up to its long-poll timeout to return. Force-exit after 2s.
   setTimeout(() => process.exit(0), 2000)
@@ -646,17 +675,38 @@ process.stdin.on('end', shutdown)
 process.stdin.on('close', shutdown)
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
+process.on('SIGHUP', shutdown)
+
+// Orphan watchdog: stdin events above don't reliably fire when the parent
+// chain (`bun run` wrapper → shell → us) is severed by a crash. Poll for
+// reparenting (POSIX) or a dead stdin pipe and self-terminate.
+const bootPpid = process.ppid
+setInterval(() => {
+  const orphaned =
+    (process.platform !== 'win32' && process.ppid !== bootPpid) ||
+    process.stdin.destroyed ||
+    process.stdin.readableEnded
+  if (orphaned) shutdown()
+}, 5000).unref()
 
 // Commands are DM-only. Responding in groups would: (1) leak pairing codes via
 // /status to other group members, (2) confirm bot presence in non-allowlisted
 // groups, (3) spam channels the operator never approved. Silent drop matches
 // the gate's behavior for unrecognized groups.
 
-bot.command('start', async ctx => {
-  if (ctx.chat?.type !== 'private') return
-  const access = loadAccess()
-  if (access.dmPolicy === 'disabled') {
-    await ctx.reply(`This bot isn't accepting new connections.`)
+bot.command('start', async (ctx, next) => {
+  const gated = dmCommandGate(ctx)
+  if (!gated) return
+  // In PAIRING mode /start shows the pairing instructions (the bot has no
+  // session to greet from yet). In OPEN or ALLOWLIST mode there is no pairing
+  // step, so showing pairing junk would be wrong — instead fall through to the
+  // normal message:text handler (registered after this one) so /start reaches
+  // gate() -> deliver and the agent greets the customer in persona. The
+  // delivered content is the literal "/start"; the agent's persona prompt
+  // handles the welcome. dmCommandGate already dropped disabled / non-
+  // allowlisted senders, so only authorized chats fall through here.
+  if (gated.access.dmPolicy !== 'pairing') {
+    await next()
     return
   }
   await ctx.reply(
@@ -669,7 +719,7 @@ bot.command('start', async ctx => {
 })
 
 bot.command('help', async ctx => {
-  if (ctx.chat?.type !== 'private') return
+  if (!dmCommandGate(ctx)) return
   await ctx.reply(
     `Messages you send here route to a paired Claude Code session. ` +
     `Text and photos are forwarded; replies and reactions come back.\n\n` +
@@ -679,14 +729,12 @@ bot.command('help', async ctx => {
 })
 
 bot.command('status', async ctx => {
-  if (ctx.chat?.type !== 'private') return
-  const from = ctx.from
-  if (!from) return
-  const senderId = String(from.id)
-  const access = loadAccess()
+  const gated = dmCommandGate(ctx)
+  if (!gated) return
+  const { access, senderId } = gated
 
   if (access.allowFrom.includes(senderId)) {
-    const name = from.username ? `@${from.username}` : senderId
+    const name = ctx.from!.username ? `@${ctx.from!.username}` : senderId
     await ctx.reply(`Paired as ${name}.`)
     return
   }
@@ -969,49 +1017,48 @@ bot.catch(err => {
   process.stderr.write(`telegram channel: handler error (polling continues): ${err.error}\n`)
 })
 
-// 409 Conflict = another getUpdates consumer is still active (zombie from a
-// previous session, or a second Claude Code instance). Retry with backoff
-// until the slot frees up instead of crashing on the first rejection.
+// Retry polling with backoff on any error. Previously only 409 was retried —
+// a single ETIMEDOUT/ECONNRESET/DNS failure rejected bot.start(), the catch
+// returned, and polling stopped permanently while the process stayed alive
+// (MCP stdin keeps it running). Outbound tools kept working but the bot was
+// deaf to inbound messages until a full restart.
 void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({
         onStart: info => {
+          attempt = 0
           botUsername = info.username
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
-          // Register commands in Telegram's "/" autocomplete menu.
-          // Built-in bot commands plus any user-configured commands from
-          // access.json's "commands" array. User commands are appended
-          // after built-ins, so they appear below in the menu.
-          const builtinCommands = [
-            { command: 'start', description: 'Welcome and setup guide' },
-            { command: 'help', description: 'What this bot can do' },
-            { command: 'status', description: 'Check your pairing status' },
-          ]
-          const userCommands = readAccessFile().commands ?? []
           void bot.api.setMyCommands(
-            [...builtinCommands, ...userCommands],
+            [
+              { command: 'start', description: 'Welcome and setup guide' },
+              { command: 'help', description: 'What this bot can do' },
+              { command: 'status', description: 'Check your pairing status' },
+            ],
             { scope: { type: 'all_private_chats' } },
           ).catch(() => {})
         },
       })
       return // bot.stop() was called — clean exit from the loop
     } catch (err) {
-      if (err instanceof GrammyError && err.error_code === 409) {
-        const delay = Math.min(1000 * attempt, 15000)
-        const detail = attempt === 1
-          ? ' — another instance is polling (zombie session, or a second Claude Code running?)'
-          : ''
-        process.stderr.write(
-          `telegram channel: 409 Conflict${detail}, retrying in ${delay / 1000}s\n`,
-        )
-        await new Promise(r => setTimeout(r, delay))
-        continue
-      }
+      if (shuttingDown) return
       // bot.stop() mid-setup rejects with grammy's "Aborted delay" — expected, not an error.
       if (err instanceof Error && err.message === 'Aborted delay') return
-      process.stderr.write(`telegram channel: polling failed: ${err}\n`)
-      return
+      const is409 = err instanceof GrammyError && err.error_code === 409
+      if (is409 && attempt >= 8) {
+        process.stderr.write(
+          `telegram channel: 409 Conflict persists after ${attempt} attempts — ` +
+          `another poller is holding the bot token (stray 'bun server.ts' process or a second session). Exiting.\n`,
+        )
+        return
+      }
+      const delay = Math.min(1000 * attempt, 15000)
+      const detail = is409
+        ? `409 Conflict${attempt === 1 ? ' — another instance is polling (zombie session, or a second Claude Code running?)' : ''}`
+        : `polling error: ${err}`
+      process.stderr.write(`telegram channel: ${detail}, retrying in ${delay / 1000}s\n`)
+      await new Promise(r => setTimeout(r, delay))
     }
   }
 })()
